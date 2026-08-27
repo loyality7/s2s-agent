@@ -42,7 +42,7 @@ kotlin {
 }
 
 dependencies {
-    api("com.github.loyality7:speech-to-speech-mobile:1.0.5")
+    api("com.github.loyality7:speech-to-speech-mobile:1.0.6")
 
     // Only the core contracts — a host supplies whichever s2s-llm backend,
     // s2s-context implementation and s2s-tools/custom Tools it wants. The
