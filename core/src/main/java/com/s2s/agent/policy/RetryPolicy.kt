@@ -22,6 +22,13 @@ fun interface RetryPolicy {
             when {
                 kind == FailureKind.CANCELLED -> RetryDecision.FAIL
                 kind == FailureKind.PERMISSION_DENIED -> RetryDecision.ASK_USER
+                // A rate limit or an overloaded server is the one failure where
+                // retrying immediately makes things worse: a real device saw
+                // HTTP 429 three times in 900ms, each retry fast enough to earn
+                // the next 429, and the user got no answer. There is no backoff
+                // curve here (see the class note), so the honest decision is to
+                // stop and say so rather than spend the step budget.
+                kind == FailureKind.UNAVAILABLE -> RetryDecision.FAIL
                 kind == FailureKind.INVALID_ARGUMENTS && attempt < 1 -> RetryDecision.RETRY
                 attempt < maxAttempts -> RetryDecision.RETRY
                 else -> RetryDecision.FAIL

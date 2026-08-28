@@ -388,6 +388,32 @@ class AgentRuntime(
      * ordinary single-call generation path unchanged, which still has its own
      * malformed-tool-call guard as a second line of defense.
      */
+    /**
+     * Maps a backend's error text to a [FailureKind] so [RetryPolicy] can tell
+     * "try again" apart from "trying again cannot help".
+     *
+     * Everything used to be APPLICATION_ERROR, which the default policy
+     * retries. A real device hit that with a rate-limited remote LLM: HTTP 429
+     * came back three times in 900ms, each retry firing fast enough to
+     * guarantee the next 429, and the user got no answer. A rate limit or a
+     * rejected key is UNAVAILABLE/PERMISSION_DENIED — the loop must not burn
+     * its step budget on them.
+     *
+     * ponytail: substring match on the message, because [TokenSink.onError]
+     * carries a String and no status code. Give it a typed error if a backend
+     * ever needs finer classification than this.
+     */
+    internal fun classifyGenerationFailure(message: String): FailureKind {
+        val m = message.lowercase()
+        return when {
+            "429" in m || "rate limit" in m || "too many requests" in m -> FailureKind.UNAVAILABLE
+            "503" in m || "502" in m || "overloaded" in m -> FailureKind.UNAVAILABLE
+            "401" in m || "403" in m || "unauthorized" in m || "forbidden" in m -> FailureKind.PERMISSION_DENIED
+            "timeout" in m || "timed out" in m -> FailureKind.TIMEOUT
+            else -> FailureKind.APPLICATION_ERROR
+        }
+    }
+
     private fun classifyToolDecision(task: AgentTask, messages: List<ChatMessage>): AgentDecision? {
         val schema = toolCoordinator.structuredToolDecisionSchema(task.visibleToolNames)
         val startedAt = System.currentTimeMillis()
@@ -458,7 +484,10 @@ class AgentRuntime(
                 override fun onComplete() = done.countDown()
 
                 override fun onError(message: String, cause: Throwable?) {
-                    val kind = if (isCancelled(task.taskId)) FailureKind.CANCELLED else FailureKind.APPLICATION_ERROR
+                    val kind = when {
+                        isCancelled(task.taskId) -> FailureKind.CANCELLED
+                        else -> classifyGenerationFailure(message)
+                    }
                     failure = AgentDecision.Failure(message, kind, cause)
                     done.countDown()
                 }
