@@ -284,6 +284,62 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `WIP=1 rejects a second concurrent run for the same session`() = runBlocking {
+        val startedLatch = java.util.concurrent.CountDownLatch(1)
+        val releaseLatch = java.util.concurrent.CountDownLatch(1)
+        val blockingLlm = object : com.s2s.mobile.pipeline.LanguageModel {
+            override fun initialize(): Result<Unit> = Result.success(Unit)
+            override fun generate(
+                messages: List<com.s2s.mobile.pipeline.ChatMessage>,
+                sink: com.s2s.mobile.pipeline.TokenSink,
+                overrides: com.s2s.mobile.pipeline.GenerationOverrides?,
+            ) {
+                startedLatch.countDown()
+                releaseLatch.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                sink.onToken("done")
+                sink.onComplete()
+            }
+            override fun cancel() {}
+            override fun resetContext() {}
+            override fun trimMemory() {}
+            override fun release() {}
+        }
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(FakeLanguageModel(mutableListOf()), history, synth) // engine only needs sessionId here
+        val rt = AgentRuntime(e, blockingLlm, history, FakeTools(), InMemoryTaskStore())
+
+        val firstRunThread = Thread { rt.run("first request") }
+        firstRunThread.start()
+        assertTrue("first run should have started generation", startedLatch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+
+        try {
+            rt.run("second request")
+            org.junit.Assert.fail("expected the second concurrent run() to be rejected")
+        } catch (ex: IllegalStateException) {
+            assertTrue(ex.message!!.contains("WIP=1"))
+        } finally {
+            releaseLatch.countDown()
+            firstRunThread.join(2000)
+        }
+    }
+
+    @Test
+    fun `after a task completes the session slot is free for the next run`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("first answer", "second answer"))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val rt = runtime(e, llm, history, FakeTools())
+
+        rt.run("first")
+        Thread.sleep(150)
+        val second = rt.run("second") // must not throw — first task already reached a terminal state
+
+        assertEquals(AgentState.COMPLETED, second.state)
+    }
+
+    @Test
     fun `tool result is recorded in context before next generation`() = runBlocking {
         val llm = FakeLanguageModel(
             mutableListOf(
@@ -343,6 +399,37 @@ class AgentRuntimeTest {
         assertEquals(AgentState.WAITING_FOR_CONFIRMATION, task.state)
         assertTrue(tools.executedCalls.isEmpty())
         assertEquals(AgentState.WAITING_FOR_CONFIRMATION, store.getTask(task.taskId)?.state)
+    }
+
+    @Test
+    fun `session slot stays held while paused for confirmation, and frees on reject`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("""{"tool": "calculator", "arguments": {}}""", "final answer"))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply { register(calculatorTool()) { _, _ -> "1" } }
+        val store = InMemoryTaskStore()
+        val rt = runtime(
+            e, llm, history, tools, taskStore = store,
+            confirmationPolicy = ConfirmationPolicy { _, _ -> ConfirmationDecision.REQUIRE_CONFIRMATION },
+        )
+
+        val paused = rt.run("calculate")
+        Thread.sleep(100)
+
+        try {
+            rt.run("a second unrelated request while paused")
+            org.junit.Assert.fail("expected rejection — the session's WIP slot is still held by the paused task")
+        } catch (ex: IllegalStateException) {
+            assertTrue(ex.message!!.contains("WIP=1"))
+        }
+
+        rt.rejectConfirmation(paused.taskId)
+
+        // Slot is free now — a new run() must succeed.
+        val next = rt.run("now it should work")
+        Thread.sleep(150)
+        assertEquals(AgentState.COMPLETED, next.state)
     }
 
     @Test

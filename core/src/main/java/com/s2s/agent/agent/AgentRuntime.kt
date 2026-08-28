@@ -65,6 +65,15 @@ class AgentRuntime(
     /** Live cancellation flags for currently-running tasks — not persisted; a resumed task starts uncancelled. */
     private val cancelFlags = ConcurrentHashMap<String, AtomicBoolean>()
 
+    /**
+     * WIP=1 per session: the taskId currently executing for a given
+     * sessionId, if any. Harness-enforced, not model-requested — a second
+     * [run] call for a session that already has one in flight is rejected
+     * rather than silently interleaving two loops against the same
+     * [ContextEngine]/[S2SEngine], which would corrupt turn ordering.
+     */
+    private val activeTaskBySession = ConcurrentHashMap<String, String>()
+
     fun addListener(listener: (AgentEvent) -> Unit) {
         listeners += listener
     }
@@ -89,22 +98,36 @@ class AgentRuntime(
      * resumable, not corrupted, record.
      */
     fun run(request: String): AgentTask {
+        val sessionId = engine.sessionId
         val taskId = UUID.randomUUID().toString()
-        cancelFlags[taskId] = AtomicBoolean(false)
 
-        var task = AgentTask(
-            taskId = taskId,
-            sessionId = engine.sessionId,
-            objective = request,
-            state = AgentState.RUNNING,
-            createdAtMs = System.currentTimeMillis(),
-            visibleToolNames = skills?.findRelevant(request)?.requiredTools,
-        )
-        taskStore.createTask(task)
-        emit(AgentEvent.TaskStarted(task.taskId))
+        val previous = activeTaskBySession.putIfAbsent(sessionId, taskId)
+        check(previous == null) {
+            "Session $sessionId already has task $previous running — WIP=1 per session; wait for it to finish, pause, or fail before starting another"
+        }
 
-        context.addUser(request)
-        return loop(task)
+        try {
+            cancelFlags[taskId] = AtomicBoolean(false)
+
+            var task = AgentTask(
+                taskId = taskId,
+                sessionId = sessionId,
+                objective = request,
+                state = AgentState.RUNNING,
+                createdAtMs = System.currentTimeMillis(),
+                visibleToolNames = skills?.findRelevant(request)?.requiredTools,
+            )
+            taskStore.createTask(task)
+            emit(AgentEvent.TaskStarted(task.taskId))
+
+            context.addUser(request)
+            val result = loop(task)
+            if (result.state != AgentState.WAITING_FOR_CONFIRMATION) activeTaskBySession.remove(sessionId, taskId)
+            return result
+        } catch (e: Throwable) {
+            activeTaskBySession.remove(sessionId, taskId)
+            throw e
+        }
     }
 
     /**
@@ -119,10 +142,13 @@ class AgentRuntime(
             "Task $taskId is not waiting for confirmation (state=${stored.state})"
         }
         cancelFlags.getOrPut(taskId) { AtomicBoolean(false) }
+        activeTaskBySession[stored.sessionId] = taskId
 
         val call = stored.pendingToolCall ?: error("Task $taskId has no pending tool call to resume")
         val afterTool = executeTool(stored.copy(state = AgentState.EXECUTING_TOOL, pendingToolCall = null, pendingCallId = null), call)
-        return loop(afterTool)
+        val result = loop(afterTool)
+        if (result.state != AgentState.WAITING_FOR_CONFIRMATION) activeTaskBySession.remove(stored.sessionId, taskId)
+        return result
     }
 
     /** Marks a pending confirmation rejected and fails the task — no tool execution happens. */
@@ -137,6 +163,7 @@ class AgentRuntime(
             updatedAtMs = System.currentTimeMillis(),
         )
         taskStore.checkpointTask(failed)
+        activeTaskBySession.remove(stored.sessionId, taskId)
         emit(AgentEvent.TaskFailed(failed.taskId, failed.lastError!!))
         return failed
     }
