@@ -420,11 +420,24 @@ class AgentRuntime(
 
         val text = middlewareChain.afterModel(reply.toString())
         val call = toolCoordinator.parse(text)
-        return if (call != null) {
-            updated to AgentDecision.ToolInvocation(call)
-        } else {
-            context.addAssistant(text)
-            updated to AgentDecision.FinalResponse(text)
+        return when {
+            call != null -> updated to AgentDecision.ToolInvocation(call)
+            toolCoordinator.looksLikeMalformedToolCall(text) -> {
+                // Real-device evidence: a malformed/truncated tool-call JSON
+                // fragment was previously spoken aloud verbatim here, because
+                // a failed parse fell straight through to FinalResponse. This
+                // is never recorded via context.addAssistant() either — it
+                // was never a real assistant turn, and recording it would
+                // teach the model its own broken output was accepted.
+                updated to AgentDecision.Failure(
+                    "Model produced a malformed tool call: $text",
+                    FailureKind.INVALID_ARGUMENTS,
+                )
+            }
+            else -> {
+                context.addAssistant(text)
+                updated to AgentDecision.FinalResponse(text)
+            }
         }
     }
 

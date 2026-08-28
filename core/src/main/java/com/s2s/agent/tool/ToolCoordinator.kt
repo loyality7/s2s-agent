@@ -56,6 +56,25 @@ class ToolCoordinator(
     fun parse(text: String): ToolCall? = tools.parse(text)
 
     /**
+     * True when [text] looks like an attempted tool call that [parse] could
+     * not turn into a [ToolCall] — a malformed/truncated `{"tool": ...}`
+     * blob, not genuine conversational text. Real-device evidence: a small
+     * local model occasionally emits an incomplete or malformed tool-call
+     * JSON fragment (e.g. `{"tool":"calculate","` with no closing brace);
+     * [Tools.parse] correctly returns null for it (it genuinely isn't valid
+     * JSON), but [com.s2s.agent.agent.AgentRuntime] must not then treat that
+     * null as "this is the final answer" and speak the raw fragment aloud —
+     * exactly what happened before this check existed. A conservative
+     * heuristic (starts with `{` and mentions `"tool"`) rather than a full
+     * parse: false positives just cost one wasted retry, false negatives
+     * would let broken JSON reach TTS again.
+     */
+    fun looksLikeMalformedToolCall(text: String): Boolean {
+        val trimmed = text.trimStart()
+        return trimmed.startsWith("{") && trimmed.contains("\"tool\"")
+    }
+
+    /**
      * Runs [call], then records the result in [context] — inline via
      * [ContextEngine.addToolResult] if small, or as a reference if
      * [ToolResult.output] is at least [inlineSizeLimit] characters. Large

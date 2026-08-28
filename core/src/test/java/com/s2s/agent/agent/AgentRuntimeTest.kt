@@ -163,6 +163,27 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `malformed tool-call JSON is never spoken and fails the task instead`() = runBlocking {
+        // Real-device evidence: a small local model emitted a truncated
+        // {"tool":"calculator","... fragment with no closing brace — parse()
+        // correctly returned null (it genuinely isn't valid JSON), and the
+        // old code fell through to FinalResponse, speaking the raw fragment
+        // aloud. This proves that no longer happens.
+        val llm = FakeLanguageModel(mutableListOf("""{"tool":"calc"""))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val rt = runtime(e, llm, history, FakeTools(), retryPolicy = RetryPolicy.NEVER_RETRY)
+
+        val task = rt.run("calculate something")
+        Thread.sleep(200)
+
+        assertEquals(AgentState.FAILED, task.state)
+        assertTrue(task.lastError!!.contains("malformed tool call"))
+        assertTrue(synth.synthesizedTexts.none { it.contains("\"tool\"") })
+    }
+
+    @Test
     fun `tool failure is recorded and generation continues`() = runBlocking {
         val llm = FakeLanguageModel(
             mutableListOf(
