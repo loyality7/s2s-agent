@@ -219,6 +219,38 @@ class V1ScenarioTest {
     }
 
     @Test
+    fun `a request matching no skill is sent no tool catalogue at all`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("Hey there."))
+        val history = FakeContextEngine("system")
+        val e = engine(llm, history, FakeSynthesizer())
+        val tools = FakeTools().apply {
+            register(ToolDefinition("calendar", "reads calendar")) { _, _ -> "" }
+            register(ToolDefinition("browser", "browses the web")) { _, _ -> "" }
+        }
+        val skills = SkillRegistry().apply {
+            register(
+                Skill(
+                    metadata = SkillMetadata(
+                        id = "weekly-update",
+                        name = "weekly update",
+                        description = "Creates weekly project updates.",
+                        requiredTools = setOf("calendar"),
+                    ),
+                    instructions = "Summarize the week.",
+                ),
+            )
+        }
+        val rt = AgentRuntime(e, llm, history, tools, InMemoryTaskStore(), skills = skills)
+
+        rt.run("hi")
+        Thread.sleep(150)
+
+        val systemMessage = llm.lastMessagesSeen.first { it.role == "system" }.content
+        assertFalse(systemMessage.contains("calendar"))
+        assertFalse(systemMessage.contains("browser"))
+    }
+
+    @Test
     fun `skill-gated tool exposure survives a resumed task after simulated process death`() = runBlocking {
         val llm = FakeLanguageModel(
             mutableListOf(

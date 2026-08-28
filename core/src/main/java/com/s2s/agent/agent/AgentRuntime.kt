@@ -131,7 +131,13 @@ class AgentRuntime(
                 objective = request,
                 state = AgentState.RUNNING,
                 createdAtMs = System.currentTimeMillis(),
-                visibleToolNames = skills?.findRelevant(request)?.requiredTools,
+                // No registry means "the host has no skills, expose everything"
+                // (null). A registry that matched NOTHING means "this request
+                // needs no tool" — an EMPTY set, not null: falling back to the
+                // full catalogue there would send every tool on every "hello",
+                // which is the bloat skills exist to prevent, and it lands in
+                // the system message, i.e. the cache-defeating prompt prefix.
+                visibleToolNames = skills?.let { it.findRelevant(request)?.requiredTools ?: emptySet() },
             )
             taskStore.createTask(task)
             emit(AgentEvent.TaskStarted(task.taskId))
@@ -412,7 +418,17 @@ class AgentRuntime(
         emit(AgentEvent.GenerationStarted(updated.taskId, updated.stepCount))
         val startedAt = System.currentTimeMillis()
 
-        val toolPrompt = toolCoordinator.promptSectionFor(updated.visibleToolNames)
+        // The tool catalogue is only useful while a tool call is still
+        // possible. Once one has run, this generation's job is to answer
+        // FROM the result — and re-sending the catalogue costs real time:
+        // it lands in the system message, which is the prompt's prefix, so
+        // changing it between turns is what turns a cheap cached prefill
+        // into a full one. On a phone that difference measured as seconds.
+        val toolPrompt = if (updated.toolCallCount == 0) {
+            toolCoordinator.promptSectionFor(updated.visibleToolNames)
+        } else {
+            null
+        }
         val rawMessages: List<ChatMessage> = context.messages(extraSystem = toolPrompt)
         val messages = middlewareChain.beforeModel(rawMessages)
 

@@ -34,7 +34,7 @@ class ModelProgramTest {
     // A representative program: classify a user utterance as one of two intents —
     // exactly the shape the prompt's example list describes (typed input, model
     // call, structured output), used here only to prove the primitive, not
-    // shipped as a real Jarvis feature.
+    // shipped as a real product feature.
     private data class IntentInput(val utterance: String)
     private enum class Intent { QUESTION, COMMAND, UNKNOWN }
 

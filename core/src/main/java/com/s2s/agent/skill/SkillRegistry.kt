@@ -36,7 +36,16 @@ class SkillRegistry {
     fun findRelevant(request: String): SkillMetadata? {
         val lower = request.lowercase()
         return listMetadata().firstOrNull { meta ->
-            lower.contains(meta.name.lowercase()) || meta.description.lowercase().split(" ").any { it.length > 3 && lower.contains(it) }
+            lower.contains(meta.name.lowercase()) ||
+                meta.description.lowercase()
+                    // Split on any non-alphanumeric, not just " ": splitting on
+                    // spaces alone leaves punctuation attached, so the final
+                    // word of a sentence ("result.") could never match a
+                    // request that actually said it ("the result"). Safe as an
+                    // ASCII class only because the string is already lowercased
+                    // above; a non-Latin description falls back to name matching.
+                    .split(Regex("[^a-z0-9]+"))
+                    .any { it.length > 3 && lower.contains(it) }
         }
     }
 }
