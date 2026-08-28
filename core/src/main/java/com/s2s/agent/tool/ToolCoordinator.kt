@@ -56,6 +56,56 @@ class ToolCoordinator(
     fun parse(text: String): ToolCall? = tools.parse(text)
 
     /**
+     * JSON Schema for the classify step's structured output — see
+     * [com.s2s.agent.agent.AgentRuntime]'s two-step tool-decision flow.
+     * `tool`/`arguments` are only meaningful when `needsTool` is true; the
+     * schema can't express "either this shape or plain text" (JSON Schema
+     * constrains valid JSON, it doesn't opt out of JSON entirely) — that's
+     * exactly why this is a SEPARATE classify call from the main generation,
+     * not a replacement for it. Field names (`tool`/`arguments`) deliberately
+     * match [Tools.parse]'s existing expected shape so the same parser
+     * handles both the free-text and structured paths — no second JSON
+     * parser needed. When [visibleToolNames] narrows the catalog (skill-gated
+     * progressive disclosure), only those tool names are valid enum values
+     * here — the model is never offered a tool it can't currently see.
+     */
+    fun structuredToolDecisionSchema(visibleToolNames: Set<String>? = null): String {
+        val names = (visibleToolNames?.let { names -> tools.definitions.filter { it.name in names } } ?: tools.definitions)
+            .map { it.name }
+        val toolSchema = if (names.isEmpty()) {
+            "\"type\": \"string\""
+        } else {
+            "\"type\": \"string\", \"enum\": [${names.joinToString(",") { "\"$it\"" }}]"
+        }
+        return """
+            {
+              "type": "object",
+              "properties": {
+                "needsTool": { "type": "boolean" },
+                "tool": { $toolSchema },
+                "arguments": { "type": "object" }
+              },
+              "required": ["needsTool"]
+            }
+        """.trimIndent()
+    }
+
+    /**
+     * Turns the classify step's structured JSON reply into a [ToolCall] —
+     * null if the JSON says `needsTool: false`, or if [parse] (the existing,
+     * tested `{"tool": ..., "arguments": ...}` parser) can't find a real
+     * registered tool in it. Defensive: grammar-constrained decoding with an
+     * enum should make an unregistered tool name impossible, but a caller
+     * must never trust that absolutely.
+     */
+    fun toolCallFromStructuredDecision(json: String): ToolCall? {
+        if (!json.contains("\"needsTool\"") || json.contains("\"needsTool\": false") || json.contains("\"needsTool\":false")) {
+            return null
+        }
+        return parse(json)
+    }
+
+    /**
      * True when [text] looks like an attempted tool call that [parse] could
      * not turn into a [ToolCall] — a malformed/truncated `{"tool": ...}`
      * blob, not genuine conversational text. Real-device evidence: a small

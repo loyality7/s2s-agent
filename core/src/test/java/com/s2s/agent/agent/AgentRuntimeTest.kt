@@ -184,6 +184,85 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `structured classify step calls the tool directly without a free-text generation`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("this reply should never be used"))
+        llm.structuredReply = """{"needsTool": true, "tool": "calculator", "arguments": {}}"""
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply { register(calculatorTool()) { _, _ -> "42" } }
+        val rt = runtime(e, llm, history, tools)
+
+        val task = rt.run("what is 6 times 7")
+        Thread.sleep(200)
+
+        assertEquals(1, llm.generateStructuredCallCount)
+        assertEquals(1, tools.executedCalls.size)
+        assertEquals("calculator", tools.executedCalls.single().name)
+        // The scripted free-text reply is only consumed for the SECOND
+        // generation (after the tool result) — the classify step itself
+        // never called generate() to decide the tool.
+    }
+
+    @Test
+    fun `structured classify step saying no tool needed falls through to normal generation`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("Hello! How can I help?"))
+        llm.structuredReply = """{"needsTool": false}"""
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply { register(calculatorTool()) { _, _ -> "unused" } }
+        val rt = runtime(e, llm, history, tools)
+
+        val task = rt.run("hello")
+        Thread.sleep(200)
+
+        assertEquals(AgentState.COMPLETED, task.state)
+        assertEquals(1, llm.generateStructuredCallCount)
+        assertEquals(1, llm.generateCallCount)
+        assertTrue(tools.executedCalls.isEmpty())
+        assertTrue(synth.synthesizedTexts.any { it.contains("Hello") })
+    }
+
+    @Test
+    fun `backend without structured generation support falls through unchanged`() = runBlocking {
+        // structuredReply left null — FakeLanguageModel.generateStructured()
+        // fails, matching a real backend (e.g. RemoteLanguageModel) that
+        // never overrides the LanguageModel default.
+        val llm = FakeLanguageModel(mutableListOf("A plain conversational reply."))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply { register(calculatorTool()) { _, _ -> "unused" } }
+        val rt = runtime(e, llm, history, tools)
+
+        val task = rt.run("hello")
+        Thread.sleep(200)
+
+        assertEquals(AgentState.COMPLETED, task.state)
+        assertEquals(1, llm.generateStructuredCallCount)
+        assertEquals(1, llm.generateCallCount)
+        assertTrue(synth.synthesizedTexts.any { it.contains("plain conversational reply") })
+    }
+
+    @Test
+    fun `classify step is skipped entirely when no tools are registered`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("A plain conversational reply."))
+        llm.structuredReply = """{"needsTool": true, "tool": "calculator", "arguments": {}}"""
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val rt = runtime(e, llm, history, FakeTools()) // no tools registered
+
+        val task = rt.run("hello")
+        Thread.sleep(200)
+
+        assertEquals(AgentState.COMPLETED, task.state)
+        assertEquals(0, llm.generateStructuredCallCount)
+        assertEquals(1, llm.generateCallCount)
+    }
+
+    @Test
     fun `tool failure is recorded and generation continues`() = runBlocking {
         val llm = FakeLanguageModel(
             mutableListOf(

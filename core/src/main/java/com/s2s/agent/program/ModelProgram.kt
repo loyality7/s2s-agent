@@ -69,3 +69,30 @@ fun <Input, Output> modelProgram(
 
 /** Thrown when the underlying [LanguageModel.generate] call fails — the caller decides whether that's retryable, same as any other model-call failure. */
 class ModelProgramException(message: String) : Exception(message)
+
+/**
+ * Same shape as [modelProgram], but calls [LanguageModel.generateStructured]
+ * instead of [LanguageModel.generate] — for a program whose output must be
+ * reliably shaped (a tool-call decision, a classification), not free text
+ * parsed after the fact. First real consumer: [com.s2s.agent.tool.ToolDecision]'s
+ * classify step, added after real-device testing showed free-text
+ * `{"tool": ...}` parsing let a small model emit malformed/truncated JSON
+ * with nothing structurally preventing it.
+ *
+ * Returns null (never throws) when the backing [LanguageModel] doesn't
+ * support [LanguageModel.generateStructured] (its default implementation
+ * fails) or the call otherwise errors — the caller must have a fallback path
+ * for a model/backend that can't do grammar-constrained decoding, since not
+ * every [LanguageModel] implementation can.
+ */
+fun <Input, Output> structuredModelProgram(
+    jsonSchema: String,
+    overrides: GenerationOverrides? = null,
+    buildMessages: (Input) -> List<ChatMessage>,
+    parseOutput: (Input, String) -> Output,
+): ModelProgram<Input, Output?> = ModelProgram { languageModel, input ->
+    val messages = buildMessages(input)
+    languageModel.generateStructured(messages, jsonSchema, overrides)
+        .getOrNull()
+        ?.let { parseOutput(input, it) }
+}

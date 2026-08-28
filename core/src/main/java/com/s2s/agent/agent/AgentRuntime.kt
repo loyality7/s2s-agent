@@ -365,6 +365,43 @@ class AgentRuntime(
         }
     }
 
+    /**
+     * Two-step tool decision: before the main (free-text) generation call,
+     * ask a grammar-constrained "does this need a tool" question via
+     * [LanguageModel.generateStructured]. Real-device tool-calling testing
+     * showed the single-call free-text `{"tool": ...}` protocol lets a small
+     * model emit malformed/truncated JSON with nothing structurally
+     * preventing it — this adds a reliable, schema-constrained decision
+     * before that ever happens, without forcing every ordinary conversational
+     * reply through JSON (a schema can't express "or just talk normally").
+     *
+     * Returns null when the model isn't equipped to answer (backend doesn't
+     * support [LanguageModel.generateStructured] — its default fails, which
+     * is the expected, non-error case for e.g. a remote HTTP backend), or
+     * decided no tool is needed — either way the caller falls through to the
+     * ordinary single-call generation path unchanged, which still has its own
+     * malformed-tool-call guard as a second line of defense.
+     */
+    private fun classifyToolDecision(task: AgentTask, messages: List<ChatMessage>): AgentDecision? {
+        val schema = toolCoordinator.structuredToolDecisionSchema(task.visibleToolNames)
+        val startedAt = System.currentTimeMillis()
+        val result = languageModel.generateStructured(messages, schema)
+        tracer.record(
+            TraceRecord(
+                taskId = task.taskId,
+                sessionId = task.sessionId,
+                kind = TraceKind.GENERATION,
+                timestampMs = startedAt,
+                durationMs = System.currentTimeMillis() - startedAt,
+                status = if (result.isSuccess) "ok" else "unsupported-or-error",
+                retryCount = task.retryCount,
+            ),
+        )
+        val decisionText = result.getOrNull() ?: return null
+        val call = toolCoordinator.toolCallFromStructuredDecision(decisionText) ?: return null
+        return AgentDecision.ToolInvocation(call)
+    }
+
     private fun generateOnce(task: AgentTask): Pair<AgentTask, AgentDecision> {
         var updated = task.copy(
             stepCount = task.stepCount + 1,
@@ -378,6 +415,18 @@ class AgentRuntime(
         val toolPrompt = toolCoordinator.promptSectionFor(updated.visibleToolNames)
         val rawMessages: List<ChatMessage> = context.messages(extraSystem = toolPrompt)
         val messages = middlewareChain.beforeModel(rawMessages)
+
+        // Only classify before the FIRST tool call of this task, not after
+        // one has already run — once a tool result is in context, the next
+        // generation's job is to produce the final answer FROM that result,
+        // never to classify (and potentially re-invoke) a tool again. Gating
+        // on toolCallCount, not stepCount, correctly still allows a second
+        // classify+call for a genuinely different follow-up request in the
+        // same task if one is ever added, without ever double-firing for the
+        // "answer using the tool result" step of the current tool.
+        if (updated.toolCallCount == 0 && toolCoordinator.availableTools().isNotEmpty()) {
+            classifyToolDecision(updated, rawMessages)?.let { return updated to it }
+        }
 
         val reply = StringBuilder()
         var failure: AgentDecision.Failure? = null

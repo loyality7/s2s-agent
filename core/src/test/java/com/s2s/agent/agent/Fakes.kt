@@ -26,7 +26,24 @@ class FakeLanguageModel(private val scriptedReplies: MutableList<String>) : Lang
     var lastMessagesSeen: List<ChatMessage> = emptyList()
         private set
 
+    /** When set, generateStructured() returns this instead of failing (the base LanguageModel default). Null means "not supported", the default, realistic case for most backends. */
+    var structuredReply: String? = null
+
+    var generateStructuredCallCount = 0
+        private set
+
+    /** Schema passed to the most recent generateStructured() call. */
+    var lastSchemaSeen: String? = null
+        private set
+
     override fun initialize(): Result<Unit> = Result.success(Unit)
+
+    override fun generateStructured(messages: List<ChatMessage>, jsonSchema: String, overrides: GenerationOverrides?): Result<String> {
+        generateStructuredCallCount++
+        lastSchemaSeen = jsonSchema
+        val reply = structuredReply ?: return Result.failure(UnsupportedOperationException("structured generation not configured in this fake"))
+        return Result.success(reply)
+    }
 
     override fun generate(messages: List<ChatMessage>, sink: TokenSink, overrides: GenerationOverrides?) {
         generateCallCount++
