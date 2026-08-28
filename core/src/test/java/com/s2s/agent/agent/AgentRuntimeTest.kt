@@ -533,6 +533,115 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `tool failure with no-retry policy fails the task instead of continuing`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("""{"tool": "calculator", "arguments": {}}"""))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply {
+            register(calculatorTool()) { _, _ -> "unused" }
+            failNext = true
+        }
+        val rt = runtime(e, llm, history, tools, retryPolicy = RetryPolicy.NEVER_RETRY)
+
+        val task = rt.run("calculate something")
+        Thread.sleep(200)
+
+        assertEquals(AgentState.FAILED, task.state)
+        assertTrue(task.lastError!!.contains("calculator"))
+    }
+
+    @Test
+    fun `resumeTask releases the WIP session slot if it throws`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("won't be reached"))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val store = InMemoryTaskStore()
+        val rt = runtime(e, llm, history, FakeTools(), taskStore = store)
+
+        // A confirmation task with no pending tool call is an invalid resume —
+        // resumeTask's error("...no pending tool call...") must still free the slot.
+        val badTask = AgentTask(
+            taskId = "bad-task",
+            sessionId = e.sessionId,
+            objective = "x",
+            state = AgentState.WAITING_FOR_CONFIRMATION,
+            createdAtMs = System.currentTimeMillis(),
+            pendingToolCall = null,
+        )
+        store.createTask(badTask)
+
+        try {
+            rt.resumeTask("bad-task")
+            org.junit.Assert.fail("expected resumeTask to throw")
+        } catch (ex: IllegalStateException) {
+            // expected — "has no pending tool call to resume"
+        }
+
+        // Slot must be free now, not stuck holding "bad-task".
+        val next = rt.run("now it should work")
+        Thread.sleep(150)
+        assertEquals(AgentState.COMPLETED, next.state)
+    }
+
+    @Test
+    fun `verifier rejects a confirmed tool result and fails the task`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("""{"tool": "calculator", "arguments": {}}"""))
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply { register(calculatorTool()) { _, _ -> "unexpected output" } }
+        val store = InMemoryTaskStore()
+        val refuter = com.s2s.agent.verify.Verifier { _ ->
+            com.s2s.agent.verify.VerificationOutcome(com.s2s.agent.verify.VerificationVerdict.NOT_VERIFIED, "output not what was expected")
+        }
+        val rt = AgentRuntime(
+            e, llm, history, tools, store,
+            confirmationPolicy = ConfirmationPolicy { _, _ -> ConfirmationDecision.REQUIRE_CONFIRMATION },
+            verifier = refuter,
+        )
+
+        val paused = rt.run("calculate")
+        Thread.sleep(100)
+        val resumed = rt.resumeTask(paused.taskId)
+        Thread.sleep(100)
+
+        assertEquals(AgentState.FAILED, resumed.state)
+        assertTrue(resumed.lastError!!.contains("Verification failed"))
+    }
+
+    @Test
+    fun `verifier accepts a confirmed tool result and the task proceeds normally`() = runBlocking {
+        val llm = FakeLanguageModel(
+            mutableListOf(
+                """{"tool": "calculator", "arguments": {}}""",
+                "All good.",
+            ),
+        )
+        val history = FakeContextEngine("system")
+        val synth = FakeSynthesizer()
+        val e = engine(llm, history, synth)
+        val tools = FakeTools().apply { register(calculatorTool()) { _, _ -> "expected output" } }
+        val store = InMemoryTaskStore()
+        val accepter = com.s2s.agent.verify.Verifier { _ ->
+            com.s2s.agent.verify.VerificationOutcome(com.s2s.agent.verify.VerificationVerdict.VERIFIED, "looks right")
+        }
+        val rt = AgentRuntime(
+            e, llm, history, tools, store,
+            confirmationPolicy = ConfirmationPolicy { _, _ -> ConfirmationDecision.REQUIRE_CONFIRMATION },
+            verifier = accepter,
+        )
+
+        val paused = rt.run("calculate")
+        Thread.sleep(100)
+        val resumed = rt.resumeTask(paused.taskId)
+        Thread.sleep(150)
+
+        assertEquals(AgentState.COMPLETED, resumed.state)
+    }
+
+    @Test
     fun `task checkpoints exist in the store after completion`() = runBlocking {
         val llm = FakeLanguageModel(mutableListOf("final answer"))
         val history = FakeContextEngine("system")
