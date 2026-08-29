@@ -192,8 +192,16 @@ class FileTaskStore(private val directory: File) : TaskStore {
 
     private fun skipString(s: String, quote: Int): Int = (endOfString(s, quote) ?: (s.length - 1)) + 1
 
+    // Kept identical to s2s-tools' ToolRegistry.unescape — same minimal JSON
+    // parser, independently written because s2s-agent and s2s-tools do not
+    // depend on each other by design (see this file's class doc: org.json is
+    // stubbed under plain-JVM unit tests, so both repos hand-roll the same
+    // narrow parser rather than share a module across a boundary that
+    // otherwise has no reason to exist). A ponytail audit found this copy had
+    // drifted — missing the \t case the other copy already handled.
     private fun unescape(s: String): String = s
         .replace("\\n", "\n")
+        .replace("\\t", "\t")
         .replace("\\\"", "\"")
         .replace("\\\\", "\\")
 }
