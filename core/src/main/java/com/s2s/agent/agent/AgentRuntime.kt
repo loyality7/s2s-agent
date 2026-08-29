@@ -1,6 +1,5 @@
 package com.s2s.agent.agent
 
-import com.s2s.agent.middleware.MiddlewareChain
 import com.s2s.agent.policy.ConfirmationDecision
 import com.s2s.agent.policy.ConfirmationPolicy
 import com.s2s.agent.policy.ExecutionBudget
@@ -14,10 +13,6 @@ import com.s2s.agent.trace.AgentTracer
 import com.s2s.agent.trace.NoopTracer
 import com.s2s.agent.trace.TraceKind
 import com.s2s.agent.trace.TraceRecord
-import com.s2s.agent.verify.VerificationOutcome
-import com.s2s.agent.verify.VerificationRequest
-import com.s2s.agent.verify.VerificationVerdict
-import com.s2s.agent.verify.Verifier
 import com.s2s.mobile.S2SEngine
 import com.s2s.mobile.pipeline.ChatMessage
 import com.s2s.mobile.pipeline.ContextEngine
@@ -56,25 +51,11 @@ class AgentRuntime(
     private val budget: ExecutionBudget = ExecutionBudget(),
     private val retryPolicy: RetryPolicy = RetryPolicy.boundedRetry(2),
     private val confirmationPolicy: ConfirmationPolicy = ConfirmationPolicy.ALWAYS_EXECUTE,
-    middleware: List<com.s2s.agent.middleware.AgentMiddleware> = emptyList(),
     private val tracer: AgentTracer = NoopTracer,
     /** Optional — when set, [findRelevant] narrows tool exposure to the matched skill's [com.s2s.agent.skill.SkillMetadata.requiredTools] instead of the full catalog. */
     private val skills: SkillRegistry? = null,
-    /**
-     * Optional independent check on a consequential tool's observable result.
-     * Applied only to calls the host's [confirmationPolicy] already flagged
-     * as [ConfirmationDecision.REQUIRE_CONFIRMATION] — the harness does not
-     * invent its own notion of "consequential" beyond what the host already
-     * decided. Never asked "did this succeed?" of the model itself; the
-     * model's own [AgentDecision.FinalResponse] text is never treated as
-     * proof a prior tool call worked. Null (the default) means no
-     * verification runs — a tool's [com.s2s.mobile.pipeline.ToolResult.isError]
-     * remains the only signal, same as before this existed.
-     */
-    private val verifier: Verifier? = null,
 ) {
     private val toolCoordinator = ToolCoordinator(tools, context)
-    private val middlewareChain = MiddlewareChain(middleware)
     private val listeners = CopyOnWriteArrayList<(AgentEvent) -> Unit>()
     private val callSequence = AtomicInteger(0)
 
@@ -203,13 +184,7 @@ class AgentRuntime(
                 return task
             }
 
-            val verified = verifyIfConfigured(task, call, toolResult)
-            if (verified.isTerminal()) {
-                activeTaskBySession.remove(stored.sessionId, taskId)
-                return verified
-            }
-
-            val result = loop(verified)
+            val result = loop(task)
             if (result.state != AgentState.WAITING_FOR_CONFIRMATION) activeTaskBySession.remove(stored.sessionId, taskId)
             return result
         } catch (e: Throwable) {
@@ -247,35 +222,7 @@ class AgentRuntime(
         }
     }
 
-    /**
-     * Independent check on a tool that just executed after confirmation —
-     * only reached for calls the host already flagged as consequential (see
-     * [verifier]'s doc). Returns [task] unchanged when [verifier] is null or
-     * the outcome is [VerificationVerdict.VERIFIED]; otherwise fails the task
-     * with the verifier's own reason, never the model's opinion.
-     */
-    private fun verifyIfConfigured(task: AgentTask, call: ToolCall, toolResult: com.s2s.mobile.pipeline.ToolResult): AgentTask {
-        val v = verifier ?: return task
-        val outcome: VerificationOutcome = v.verify(
-            VerificationRequest(
-                objective = task.objective,
-                actionDescription = "Called tool '${call.name}' with arguments ${call.arguments}",
-                result = toolResult.output,
-                successCriteria = emptyList(),
-            ),
-        )
-        if (outcome.verdict == VerificationVerdict.VERIFIED) return task
-
-        val failed = task.copy(
-            state = AgentState.FAILED,
-            lastError = "Verification failed for tool '${call.name}': ${outcome.reason}",
-            updatedAtMs = System.currentTimeMillis(),
-        )
-        taskStore.checkpointTask(failed)
-        emit(AgentEvent.TaskFailed(failed.taskId, failed.lastError!!))
-        return failed
-    }
-
+    
     /** Marks a pending confirmation rejected and fails the task — no tool execution happens. */
     fun rejectConfirmation(taskId: String): AgentTask {
         val stored = taskStore.getTask(taskId) ?: error("No such task: $taskId")
@@ -359,7 +306,7 @@ class AgentRuntime(
                         return task
                     }
 
-                    val call = middlewareChain.beforeTool(decision.call)
+                    val call = decision.call
                     val confirmation = confirmationPolicy.decide(call.name, call.arguments)
 
                     if (confirmation == ConfirmationDecision.REJECT) {
@@ -484,7 +431,7 @@ class AgentRuntime(
             null
         }
         val rawMessages: List<ChatMessage> = context.messages(extraSystem = toolPrompt)
-        val messages = middlewareChain.beforeModel(rawMessages)
+        val messages = rawMessages
 
         // Only classify before the FIRST tool call of this task, not after
         // one has already run — once a tool result is in context, the next
@@ -540,7 +487,7 @@ class AgentRuntime(
 
         failure?.let { return updated to it }
 
-        val text = middlewareChain.afterModel(reply.toString())
+        val text = reply.toString()
         val call = toolCoordinator.parse(text)
         return when {
             call != null -> updated to AgentDecision.ToolInvocation(call)
@@ -576,7 +523,7 @@ class AgentRuntime(
         emit(AgentEvent.ToolCallStarted(updated.taskId, call.name, callId))
         val startedAt = System.currentTimeMillis()
 
-        val result = middlewareChain.afterTool(toolCoordinator.execute(call, toolContext))
+        val result = toolCoordinator.execute(call, toolContext)
 
         tracer.record(
             TraceRecord(

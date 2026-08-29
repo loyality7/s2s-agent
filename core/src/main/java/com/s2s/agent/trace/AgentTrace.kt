@@ -18,21 +18,10 @@ data class TraceRecord(
     val retryCount: Int = 0,
 )
 
-enum class TraceKind { GENERATION, TOOL_CALL, VERIFICATION, FINAL_RESPONSE }
+enum class TraceKind { GENERATION, TOOL_CALL, FINAL_RESPONSE }
 
 fun interface AgentTracer {
     fun record(trace: TraceRecord)
-}
-
-/** Keeps every [TraceRecord] in memory — for tests and lightweight local inspection, not a production sink. */
-class InMemoryTracer : AgentTracer {
-    private val records = mutableListOf<TraceRecord>()
-
-    override fun record(trace: TraceRecord) {
-        synchronized(records) { records += trace }
-    }
-
-    fun all(): List<TraceRecord> = synchronized(records) { records.toList() }
 }
 
 val NoopTracer = AgentTracer { }
