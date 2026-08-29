@@ -103,6 +103,23 @@ class AgentRuntime(
         languageModel.cancel()
     }
 
+    /**
+     * Cancels whatever task is running for [sessionId], if any, and returns
+     * whether there was one.
+     *
+     * Exists for barge-in: the user talks over the assistant, and the caller
+     * needs the running turn stopped before starting the new one. Without this
+     * a host could only discover the WIP=1 conflict by catching the
+     * IllegalStateException [run] throws — which on a real device meant the
+     * second utterance was swallowed by a coroutine that died silently, giving
+     * no reply and no log.
+     */
+    fun cancelSession(sessionId: String): Boolean {
+        val taskId = activeTaskBySession[sessionId] ?: return false
+        cancel(taskId)
+        return true
+    }
+
     private fun isCancelled(taskId: String) = cancelFlags[taskId]?.get() == true
 
     /**
@@ -117,7 +134,18 @@ class AgentRuntime(
         val sessionId = engine.sessionId
         val taskId = UUID.randomUUID().toString()
 
-        val previous = activeTaskBySession.putIfAbsent(sessionId, taskId)
+        // A task that has been cancelled is on its way out but may not have
+        // released the slot yet — cancellation is observed between steps, not
+        // instantly. Give it a moment rather than rejecting the caller for a
+        // conflict that is about to resolve itself: the barge-in case (cancel
+        // the running turn, immediately start the new one) would otherwise
+        // still lose the new utterance, just for a different reason.
+        var previous = activeTaskBySession.putIfAbsent(sessionId, taskId)
+        val waitUntil = System.currentTimeMillis() + CANCELLED_SLOT_WAIT_MS
+        while (previous != null && isCancelled(previous) && System.currentTimeMillis() < waitUntil) {
+            Thread.sleep(CANCELLED_SLOT_POLL_MS)
+            previous = activeTaskBySession.putIfAbsent(sessionId, taskId)
+        }
         check(previous == null) {
             "Session $sessionId already has task $previous running — WIP=1 per session; wait for it to finish, pause, or fail before starting another"
         }
@@ -564,5 +592,17 @@ class AgentRuntime(
         )
         emit(AgentEvent.ToolCallCompleted(updated.taskId, call.name, callId, result.isError))
         return updated to result
+    }
+
+    private companion object {
+        /**
+         * How long [run] waits for a cancelled predecessor to release the
+         * session's WIP slot. Cancellation is observed between steps, so the
+         * slot frees within roughly one step; this only has to outlast that,
+         * and failing after it is the honest outcome rather than blocking a
+         * voice turn indefinitely.
+         */
+        const val CANCELLED_SLOT_WAIT_MS = 2_000L
+        const val CANCELLED_SLOT_POLL_MS = 25L
     }
 }

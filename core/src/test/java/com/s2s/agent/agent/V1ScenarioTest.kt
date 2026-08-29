@@ -219,6 +219,34 @@ class V1ScenarioTest {
     }
 
     @Test
+    fun `cancelSession frees the slot so a barge-in turn can start`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("First answer.", "Second answer."))
+        val history = FakeContextEngine("system")
+        val e = engine(llm, history, FakeSynthesizer())
+        val rt = AgentRuntime(e, llm, history, FakeTools(), InMemoryTaskStore())
+
+        // What the device hit: the user talks over the reply, so a second turn
+        // starts while the first still owns the session's WIP slot. The fakes
+        // complete instantly, so this asserts the invariant that matters —
+        // cancelSession() is always safe to call before a turn, and the next
+        // turn runs regardless of whether one was actually in flight.
+        rt.run("first question")
+        rt.cancelSession(e.sessionId)
+        val second = rt.run("second question")
+        assertEquals(AgentState.COMPLETED, second.state)
+    }
+
+    @Test
+    fun `cancelSession reports when there was nothing to cancel`() = runBlocking {
+        val llm = FakeLanguageModel(mutableListOf("Answer."))
+        val history = FakeContextEngine("system")
+        val e = engine(llm, history, FakeSynthesizer())
+        val rt = AgentRuntime(e, llm, history, FakeTools(), InMemoryTaskStore())
+
+        assertFalse(rt.cancelSession(e.sessionId))
+    }
+
+    @Test
     fun `a request matching no skill is sent no tool catalogue at all`() = runBlocking {
         val llm = FakeLanguageModel(mutableListOf("Hey there."))
         val history = FakeContextEngine("system")
